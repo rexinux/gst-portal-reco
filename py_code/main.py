@@ -1,98 +1,164 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any
 
-try:
-    from .config import Config
-    from .parsers import parse_gstr1, parse_gstr2b, parse_gstr3b, parse_ledger_csv
-    from .reconciler import compare_summary
-    from .report import build_workbook
-    from .utils import detect_file_kind
-except ImportError:  # pragma: no cover
-    import sys
-    from pathlib import Path as _Path
-    sys.path.append(str(_Path(__file__).resolve().parent.parent))
-    from py_code.config import Config
-    from py_code.parsers import parse_gstr1, parse_gstr2b, parse_gstr3b, parse_ledger_csv
-    from py_code.reconciler import compare_summary
-    from py_code.report import build_workbook
-    from py_code.utils import detect_file_kind
+from . import parsers, reconciler
+from .config import Config, FOLDERS, SUPPORTED_EXTENSIONS
+from .report import build_report
 
-def scan_folder(folder: Path) -> list[Path]:
+
+def _files_in(folder: Path) -> list[Path]:
     if not folder.exists():
         return []
-    files = []
-    for p in folder.rglob("*"):
-        if p.is_file() and p.suffix.lower() in {".pdf", ".xlsx", ".xls", ".csv"}:
-            files.append(p)
-    return sorted(files)
+    return sorted(
+        p for p in folder.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS and not p.name.startswith("~$")
+    )
 
-def load_inputs(input_root: Path) -> dict[str, list[Path]]:
-    groups = {k: [] for k in [
-        "gstr1","gstr2a","gstr2b","gstr3b",
-        "electronic_credit_ledger","electronic_cash_ledger","electronic_liability_ledger",
-    ]}
-    for key in groups:
-        groups[key] = scan_folder(input_root / key)
-    return groups
 
-def process(input_root: Path, output_path: Path) -> Path:
-    groups = load_inputs(input_root)
+def _parse_folder(folder: Path, parse_fn) -> tuple[list[dict[str, Any]], list[str]]:
+    results = []
+    errors = []
+    for f in _files_in(folder):
+        try:
+            results.append(parse_fn(f))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"Failed to parse {f.name}: {exc}")
+    return results, errors
 
-    payload: dict[str, Any] = {"notes": []}
-    ledgers: list[dict[str, Any]] = []
 
-    # Pick latest file in each folder for this build.
-    g1_file = groups["gstr1"][-1] if groups["gstr1"] else None
-    g3_file = groups["gstr3b"][-1] if groups["gstr3b"] else None
-    g2b_file = groups["gstr2b"][-1] if groups["gstr2b"] else None
+def _parse_ledger_folder(folder: Path, ledger_type: str) -> tuple[dict[str, Any], list[str]]:
+    files = _files_in(folder)
+    if not files:
+        return {"return_type": ledger_type, "transactions": [], "duplicates_dropped": 0, "file_notes": [], "source_files": []}, []
+    parsed = [parsers.parse_ledger_csv(f, ledger_type) for f in files]
+    merged = parsers.merge_ledger_files(parsed)
+    return merged, []
 
-    if g1_file:
-        payload["gstr1"] = parse_gstr1(g1_file)
-    else:
-        payload["gstr1"] = {}
 
-    if g3_file:
-        payload["gstr3b"] = parse_gstr3b(g3_file)
-    else:
-        payload["gstr3b"] = {}
+def run(config: Config) -> dict[str, Any]:
+    input_root = config.input_root
+    data_quality_notes: list[str] = []
 
-    if g2b_file:
-        payload["gstr2b"] = parse_gstr2b(g2b_file)
-    else:
-        payload["gstr2b"] = {"summary": [], "detail": []}
+    gstr1_list, err = _parse_folder(input_root / FOLDERS["gstr1"], parsers.parse_gstr1)
+    data_quality_notes += err
+    gstr3b_list, err = _parse_folder(input_root / FOLDERS["gstr3b"], parsers.parse_gstr3b)
+    data_quality_notes += err
+    gstr2b_list, err = _parse_folder(input_root / FOLDERS["gstr2b"], parsers.parse_gstr2b)
+    data_quality_notes += err
 
-    # Optional ledgers
-    for key in ["electronic_credit_ledger", "electronic_cash_ledger", "electronic_liability_ledger"]:
-        for file in groups[key]:
-            led = parse_ledger_csv(file)
-            ledgers.append(led)
-    payload["ledgers"] = ledgers
+    if not gstr1_list:
+        data_quality_notes.append(
+            f"No GSTR-1 files found in '{FOLDERS['gstr1']}'. Add the GSTR-1 summary PDF/Excel for each period "
+            f"and re-run to get the outward reconciliation."
+        )
+    if not gstr3b_list:
+        data_quality_notes.append(
+            f"No GSTR-3B files found in '{FOLDERS['gstr3b']}'. Add the GSTR-3B summary PDF/Excel for each period "
+            f"and re-run to get the ITC and outward reconciliation."
+        )
+    if not gstr2b_list:
+        data_quality_notes.append(
+            f"No GSTR-2B files found in '{FOLDERS['gstr2b']}'. Add the GSTR-2B Excel export for each period "
+            f"and re-run to get the ITC reconciliation and the uncommon-entry annexure."
+        )
 
-    # notes
-    payload["notes"].append(("Input root", str(input_root)))
-    payload["notes"].append(("GSTR-1 files found", str(len(groups["gstr1"]))))
-    payload["notes"].append(("GSTR-2B files found", str(len(groups["gstr2b"]))))
-    payload["notes"].append(("GSTR-3B files found", str(len(groups["gstr3b"]))))
-    payload["notes"].append(("Ledger files found", str(len(ledgers))))
-    if groups["gstr2a"]:
-        payload["notes"].append(("GSTR-2A files found", str(len(groups["gstr2a"]))))
-    else:
-        payload["notes"].append(("GSTR-2A", "Optional folder not used in this run"))
+    gstr1_by_period, c1 = reconciler.index_by_period(gstr1_list)
+    gstr3b_by_period, c2 = reconciler.index_by_period(gstr3b_list)
+    gstr2b_by_period, c3 = reconciler.index_by_period(gstr2b_list)
+    data_quality_notes += c1 + c2 + c3
 
-    payload["recon"] = compare_summary(payload.get("gstr1"), payload.get("gstr3b"), payload.get("gstr2b"), ledgers)
+    merged_credit, e1 = _parse_ledger_folder(input_root / FOLDERS["electronic_credit_ledger"], "electronic_credit_ledger")
+    merged_cash, e2 = _parse_ledger_folder(input_root / FOLDERS["electronic_cash_ledger"], "electronic_cash_ledger")
+    merged_liability, e3 = _parse_ledger_folder(input_root / FOLDERS["electronic_liability_ledger"], "electronic_liability_ledger")
+    data_quality_notes += e1 + e2 + e3
+    for merged, label in [(merged_credit, "Electronic Credit Ledger"), (merged_cash, "Electronic Cash Ledger"), (merged_liability, "Electronic Liability Register")]:
+        if merged.get("file_notes"):
+            data_quality_notes += [f"{label}: {n}" for n in merged["file_notes"]]
+        if merged.get("duplicates_dropped"):
+            data_quality_notes.append(
+                f"{label}: {merged['duplicates_dropped']} duplicate transaction row(s) were found across the uploaded "
+                f"export(s) and dropped (same reference no., date, description and amounts) - if that count looks "
+                f"too high or too low, double-check which files are sitting in that folder."
+            )
 
-    return build_workbook(payload, output_path)
+    all_periods = sorted(set(gstr1_by_period) | set(gstr3b_by_period) | set(gstr2b_by_period) - {"UNKNOWN"})
+    if not all_periods:
+        all_periods = ["UNKNOWN"]
 
-def main():
-    parser = argparse.ArgumentParser(description="Offline GST reconciliation engine")
-    parser.add_argument("--input-root", type=Path, default=Path("input"))
-    parser.add_argument("--output", type=Path, default=Path("output/gst_reconciliation_report.xlsx"))
-    args = parser.parse_args()
-    out = process(args.input_root, args.output)
-    print(f"Created: {out}")
+    period_payloads = []
+    for pk in all_periods:
+        g1 = gstr1_by_period.get(pk)
+        g3b = gstr3b_by_period.get(pk)
+        g2b = gstr2b_by_period.get(pk)
+
+        outward_reco = reconciler.reconcile_outward(g1, g3b)
+        itc_reco = reconciler.reconcile_itc(g3b, g2b)
+        ledger_reco = reconciler.reconcile_ledgers(pk, g3b, merged_credit, merged_cash)
+        exceptions = reconciler.build_exception_register(g2b)
+        duplicate_invoices = reconciler.find_duplicate_invoices(g2b)
+        observations = reconciler.build_observations(
+            pk, g1, g3b, g2b, itc_reco, outward_reco, exceptions, duplicate_invoices, ledger_reco
+        )
+
+        missing = []
+        if not g1:
+            missing.append("GSTR-1")
+        if not g3b:
+            missing.append("GSTR-3B")
+        if not g2b:
+            missing.append("GSTR-2B")
+        if missing:
+            data_quality_notes.append(
+                f"Period {pk}: missing {', '.join(missing)} - add the file(s) to the relevant input folder and re-run "
+                f"for a complete reconciliation of this period."
+            )
+
+        period_payloads.append({
+            "period_key": pk,
+            "gstr1": g1,
+            "gstr3b": g3b,
+            "gstr2b": g2b,
+            "outward_reco": outward_reco,
+            "itc_reco": itc_reco,
+            "ledger_reco": ledger_reco,
+            "exceptions": exceptions,
+            "duplicate_invoices": duplicate_invoices,
+            "observations": observations,
+            "missing_returns": missing,
+        })
+
+    payload = {
+        "periods": period_payloads,
+        "gstin": next((g.get("gstin") for g in gstr1_list if g.get("gstin")), None)
+                 or next((g.get("gstin") for g in gstr3b_list if g.get("gstin")), None),
+        "merged_credit": merged_credit,
+        "merged_cash": merged_cash,
+        "merged_liability": merged_liability,
+        "data_quality_notes": data_quality_notes,
+        "tolerance": config.tolerance,
+    }
+    return payload
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="GST reconciliation report generator")
+    parser.add_argument("--input-root", default="input", type=Path)
+    parser.add_argument("--output", default="output/gst_reconciliation_report.xlsx", type=Path)
+    parser.add_argument("--tolerance", default=0.50, type=float)
+    args = parser.parse_args(argv)
+
+    config = Config(input_root=args.input_root, output_path=args.output, tolerance=args.tolerance)
+    payload = run(config)
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    build_report(payload, args.output)
+    print(f"Created: {args.output}")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

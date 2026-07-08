@@ -68,3 +68,47 @@ def to_month_label(text: str | None) -> str:
     if not s:
         return ""
     return s.replace("'", "").replace("–", "-")
+
+MONTH_MAP = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04", "MAY": "05", "JUN": "06",
+    "JUL": "07", "AUG": "08", "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+}
+
+def period_key_from_date(date_text: str | None) -> str:
+    """Best-effort 'YYYY-MM' key from a dd/mm/yyyy style date string."""
+    s = normalize_space(date_text)
+    if not s or s == "-":
+        return ""
+    m = re.match(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", s)
+    if not m:
+        return ""
+    dd, mm, yy = m.groups()
+    yy = yy if len(yy) == 4 else ("20" + yy)
+    try:
+        mm_i = int(mm)
+        if 1 <= mm_i <= 12:
+            return f"{yy}-{mm_i:02d}"
+    except Exception:
+        pass
+    return ""
+
+def period_key_from_label(text: str | None) -> str:
+    """Best-effort 'YYYY-MM' key from labels like 'Apr-25', 'Apr'25', 'April 2025'."""
+    s = to_month_label(text).upper()
+    if not s:
+        return ""
+    m = re.match(r"([A-Z]{3,9})[\s\-]*'?(\d{2,4})", s)
+    if not m:
+        return ""
+    mon_txt, yy = m.groups()
+    mon = mon_txt[:3]
+    if mon not in MONTH_MAP:
+        return ""
+    yy = yy if len(yy) == 4 else ("20" + yy)
+    return f"{yy}-{MONTH_MAP[mon]}"
+
+def row_fingerprint(*parts: Any) -> str:
+    """Stable fingerprint for duplicate detection across re-exported files."""
+    import hashlib
+    norm = "|".join(normalize_space(p).upper() for p in parts)
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()
