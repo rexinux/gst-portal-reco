@@ -107,6 +107,34 @@ def period_key_from_label(text: str | None) -> str:
     yy = yy if len(yy) == 4 else ("20" + yy)
     return f"{yy}-{MONTH_MAP[mon]}"
 
+def fy_months(fy_start_year: int) -> list[tuple[str, str]]:
+    """12 (label, period_key) pairs for an Indian FY: Apr(start_year) through
+    Mar(start_year+1). e.g. fy_months(2025) -> [("Apr'25","2025-04"), ..., ("Mar'26","2026-03")]."""
+    order = [(4, fy_start_year), (5, fy_start_year), (6, fy_start_year), (7, fy_start_year),
+             (8, fy_start_year), (9, fy_start_year), (10, fy_start_year), (11, fy_start_year),
+             (12, fy_start_year), (1, fy_start_year + 1), (2, fy_start_year + 1), (3, fy_start_year + 1)]
+    names = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+             7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
+    out = []
+    for mm, yy in order:
+        out.append((f"{names[mm]}'{str(yy)[2:]}", f"{yy}-{mm:02d}"))
+    return out
+
+
+def infer_fy_start_year(period_keys: list[str]) -> int:
+    """Given whatever period keys were actually found in the data, infer the
+    FY they belong to (Apr-Mar). Falls back to the current FY if nothing
+    usable is found."""
+    import datetime
+    valid = [pk for pk in period_keys if pk and pk != "UNKNOWN" and re.match(r"^\d{4}-\d{2}$", pk)]
+    if not valid:
+        today = datetime.date.today()
+        return today.year if today.month >= 4 else today.year - 1
+    y, m = valid[0].split("-")
+    y, m = int(y), int(m)
+    return y if m >= 4 else y - 1
+
+
 def row_fingerprint(*parts: Any) -> str:
     """Stable fingerprint for duplicate detection across re-exported files."""
     import hashlib

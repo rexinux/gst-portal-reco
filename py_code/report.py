@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
@@ -38,6 +39,8 @@ STATUS_FILL = {
     "Expected variance": PatternFill("solid", fgColor=AMBER),
     "Informational": PatternFill("solid", fgColor=LIGHT_BLUE),
 }
+MANUAL_FILL = PatternFill("solid", fgColor="FFF9C4")  # pale yellow - "type here"
+GROUP_FILL = PatternFill("solid", fgColor="D9E2F3")
 THIN = Side(style="thin", color="BFBFBF")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 CURRENCY = "#,##0.00"
@@ -179,38 +182,6 @@ def _build_executive_summary(wb: Workbook, payload: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Outward Reconciliation
-# ---------------------------------------------------------------------------
-
-def _build_outward_sheet(wb: Workbook, payload: dict[str, Any]) -> None:
-    ws = _sheet(wb, "Outward Reconciliation")
-    row = _title(ws, "Outward Supply Reconciliation - GSTR-1 vs GSTR-3B")
-    row = _note(ws, row, "Compares outward-supply totals as declared in GSTR-1 against the liability declared in GSTR-3B for the same period.")
-    row += 1
-
-    headers = ["Period", "Check", "GSTR-1 (Rs.)", "GSTR-3B (Rs.)", "Difference (Rs.)", "Status", "Remark"]
-    row = _header_row(ws, row, headers, widths=[12, 44, 16, 16, 14, 14, 55])
-
-    any_row = False
-    for p in payload["periods"]:
-        oreco = p["outward_reco"]
-        if not oreco.get("available"):
-            _data_row(ws, row, [_fmt_period(p["period_key"]), oreco.get("note", "Not available"), "", "", "", "", ""])
-            row += 1
-            continue
-        for i, r in enumerate(oreco["rows"]):
-            any_row = True
-            _data_row(
-                ws, row,
-                [_fmt_period(p["period_key"]), r["label"], r["value_1"], r["value_2"], r["diff"], r["status"], r.get("remark", "")],
-                currency_cols={3, 4, 5}, stripe=(i % 2 == 0), status_col=6,
-            )
-            row += 1
-    if not any_row:
-        _note(ws, row, "No outward reconciliation could be computed - GSTR-1 and/or GSTR-3B were not found for any period.")
-
-
-# ---------------------------------------------------------------------------
 # ITC Reconciliation
 # ---------------------------------------------------------------------------
 
@@ -243,72 +214,6 @@ def _build_itc_sheet(wb: Workbook, payload: dict[str, Any]) -> None:
             row += 1
     if not any_row:
         _note(ws, row, "No ITC reconciliation could be computed - GSTR-3B and/or GSTR-2B were not found for any period.")
-
-
-# ---------------------------------------------------------------------------
-# Ledger Summary
-# ---------------------------------------------------------------------------
-
-def _ledger_period_totals(merged: dict[str, Any]) -> dict[str, dict[str, float]]:
-    totals: dict[str, dict[str, float]] = {}
-    for tx in merged.get("transactions", []):
-        pk = tx.get("period_key") or "UNKNOWN"
-        t = totals.setdefault(pk, {"credit": 0.0, "debit": 0.0, "credit_n": 0, "debit_n": 0})
-        amt = tx.get("igst", 0.0) + tx.get("cgst", 0.0) + tx.get("sgst", 0.0) + tx.get("cess", 0.0)
-        if tx.get("txn_type") == "Credit":
-            t["credit"] += amt
-            t["credit_n"] += 1
-        else:
-            t["debit"] += amt
-            t["debit_n"] += 1
-    return totals
-
-
-def _build_ledger_sheet(wb: Workbook, payload: dict[str, Any]) -> None:
-    ws = _sheet(wb, "Ledger Summary")
-    row = _title(ws, "Electronic Ledger Summary")
-    row = _note(ws, row, "Period-wise credits/debits from the Cash, Credit and Liability ledgers, after de-duplicating any overlapping exports.")
-    row += 1
-
-    for label, key in [("Electronic Cash Ledger", "merged_cash"), ("Electronic Credit Ledger", "merged_credit"), ("Electronic Liability Register", "merged_liability")]:
-        merged = payload[key]
-        row = _section(ws, row, label)
-        n_files = len(merged.get("source_files", []))
-        n_dupe = merged.get("duplicates_dropped", 0)
-        row = _note(ws, row, f"Source file(s): {', '.join(merged.get('source_files', [])) or 'none found'}   |   Duplicate rows dropped: {n_dupe}")
-
-        headers = ["Period", "Credit entries", "Total credited (Rs.)", "Debit entries", "Total debited (Rs.)"]
-        row = _header_row(ws, row, headers, widths=[14, 16, 20, 16, 20])
-        totals = _ledger_period_totals(merged)
-        if not totals:
-            _note(ws, row, "No transactions parsed for this ledger.")
-            row += 2
-            continue
-        for i, pk in enumerate(sorted(totals.keys())):
-            t = totals[pk]
-            _data_row(
-                ws, row,
-                [_fmt_period(pk), t["credit_n"], round(t["credit"], 2), t["debit_n"], round(t["debit"], 2)],
-                currency_cols={3, 5}, stripe=(i % 2 == 0),
-            )
-            row += 1
-        row += 1
-
-    row = _section(ws, row, "Cross-check against GSTR-3B")
-    headers = ["Period", "Check", "Ledger (Rs.)", "GSTR-3B (Rs.)", "Difference (Rs.)", "Status"]
-    row = _header_row(ws, row, headers, widths=[12, 50, 16, 16, 14, 14])
-    any_row = False
-    for p in payload["periods"]:
-        for i, r in enumerate(p["ledger_reco"].get("rows", [])):
-            any_row = True
-            _data_row(
-                ws, row,
-                [_fmt_period(p["period_key"]), r["label"], r["value_1"], r["value_2"], r["diff"], r["status"]],
-                currency_cols={3, 4, 5}, stripe=(i % 2 == 0), status_col=6,
-            )
-            row += 1
-    if not any_row:
-        _note(ws, row, "No ledger cross-check available (GSTR-3B or ledger data missing for all periods).")
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +389,406 @@ def _build_reference_sheet(wb: Workbook, payload: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Processed Data - the single engine sheet. One row per FY month, fixed
+# order (Apr..Mar), so every formula elsewhere in the workbook can reference
+# it by a direct cell address instead of a lookup. Edit a number here and
+# every sheet that depends on it recalculates automatically.
+# ---------------------------------------------------------------------------
+
+PROCESSED_DATA_SPEC: list[tuple[str, list[tuple[str, str]]]] = [
+    ("GSTR-1 (Outward)", [
+        ("g1_taxable", "Taxable Value"), ("g1_igst", "IGST"), ("g1_cgst", "CGST"), ("g1_sgst", "SGST"),
+        ("g1_arn", "ARN"), ("g1_arn_date", "ARN Date"),
+    ]),
+    ("GSTR-3B (Outward)", [
+        ("g3b_taxable", "Taxable Value"), ("g3b_igst", "IGST"), ("g3b_cgst", "CGST"), ("g3b_sgst", "SGST"),
+        ("g3b_arn", "ARN"), ("g3b_arn_date", "ARN Date"),
+    ]),
+    ("GSTR-3B Net ITC (4C)", [
+        ("itc_igst", "IGST"), ("itc_cgst", "CGST"), ("itc_sgst", "SGST"),
+    ]),
+    ("GSTR-3B RCM Liability (3.1(d))", [
+        ("rcm_taxable", "Taxable Value"), ("rcm_igst", "IGST"), ("rcm_cgst", "CGST"), ("rcm_sgst", "SGST"),
+    ]),
+    ("Payment 6.1 - IGST (Other than RCM)", [
+        ("pay_igst_liability", "Liability"), ("pay_igst_itc_same", "Paid via IGST ITC"),
+        ("pay_igst_itc_cross", "Paid via CGST/SGST ITC"), ("pay_igst_cash", "Paid in Cash"),
+        ("pay_igst_interest", "Interest Paid"), ("pay_igst_latefee", "Late Fee Paid"),
+    ]),
+    ("Payment 6.1 - CGST (Other than RCM)", [
+        ("pay_cgst_liability", "Liability"), ("pay_cgst_itc_same", "Paid via CGST ITC"),
+        ("pay_cgst_itc_cross", "Paid via IGST ITC"), ("pay_cgst_cash", "Paid in Cash"),
+        ("pay_cgst_interest", "Interest Paid"), ("pay_cgst_latefee", "Late Fee Paid"),
+    ]),
+    ("Payment 6.1 - SGST (Other than RCM)", [
+        ("pay_sgst_liability", "Liability"), ("pay_sgst_itc_same", "Paid via SGST ITC"),
+        ("pay_sgst_itc_cross", "Paid via IGST ITC"), ("pay_sgst_cash", "Paid in Cash"),
+        ("pay_sgst_interest", "Interest Paid"), ("pay_sgst_latefee", "Late Fee Paid"),
+    ]),
+    ("Payment 6.1 - RCM (always cash)", [
+        ("rcm_pay_igst_cash", "IGST Paid"), ("rcm_pay_cgst_cash", "CGST Paid"), ("rcm_pay_sgst_cash", "SGST Paid"),
+        ("rcm_pay_interest", "Interest Paid"), ("rcm_pay_latefee", "Late Fee Paid"),
+    ]),
+    ("GSTR-2B", [
+        ("g2b_avail_igst", "ITC Available IGST"), ("g2b_avail_cgst", "ITC Available CGST"), ("g2b_avail_sgst", "ITC Available SGST"),
+        ("g2b_uncommon_count", "Uncommon Entries"), ("g2b_ineligible_cgst", "Ineligible ITC CGST"), ("g2b_ineligible_sgst", "Ineligible ITC SGST"),
+    ]),
+    ("Ledgers", [
+        ("cash_credited", "Cash Ledger Credited"), ("cash_debited", "Cash Ledger Debited"),
+        ("credit_accrued", "Credit Ledger Accrued"), ("credit_utilised", "Credit Ledger Utilised"), ("credit_carried_fwd", "Credit Carried Fwd"),
+    ]),
+]
+
+TEXT_FIELDS = {"g1_arn", "g1_arn_date", "g3b_arn", "g3b_arn_date"}
+
+
+def _build_processed_data_sheet(wb: Workbook, payload: dict[str, Any]) -> dict[str, Any]:
+    ws = _sheet(wb, "Processed Data")
+    ws.sheet_properties.tabColor = NAVY
+
+    col = 2  # column A is Period
+    field_col: dict[str, str] = {}
+    for group_label, fields in PROCESSED_DATA_SPEC:
+        start_col = col
+        for field_key, _ in fields:
+            field_col[field_key] = get_column_letter(col)
+            col += 1
+        ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=col - 1)
+        gc = ws.cell(row=1, column=start_col, value=group_label)
+        gc.font = HEADER_FONT
+        gc.fill = HEADER_FILL
+        gc.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.cell(row=1, column=1, value="")
+    ws.cell(row=2, column=1, value="Period").font = HEADER_FONT
+    ws.cell(row=2, column=1).fill = HEADER_FILL
+    ws.cell(row=2, column=1).alignment = Alignment(horizontal="center", vertical="center")
+    ws.column_dimensions["A"].width = 10
+
+    col = 2
+    for _, fields in PROCESSED_DATA_SPEC:
+        for field_key, header_label in fields:
+            c = ws.cell(row=2, column=col, value=header_label)
+            c.font = HEADER_FONT
+            c.fill = HEADER_FILL
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            ws.column_dimensions[get_column_letter(col)].width = 15 if field_key not in TEXT_FIELDS else 16
+            col += 1
+    ws.row_dimensions[2].height = 32
+    ws.freeze_panes = "B3"
+
+    data_start_row = 3
+    processed = payload["processed_data"]
+    for i, rec in enumerate(processed):
+        r = data_start_row + i
+        ws.cell(row=r, column=1, value=rec["label"]).font = BOLD_BODY
+        col = 2
+        for _, fields in PROCESSED_DATA_SPEC:
+            for field_key, _ in fields:
+                val = rec.get(field_key, "" if field_key in TEXT_FIELDS else 0.0)
+                c = ws.cell(row=r, column=col, value=val)
+                c.font = BODY_FONT
+                if field_key not in TEXT_FIELDS:
+                    c.number_format = CURRENCY if "count" not in field_key else "0"
+                if i % 2 == 0:
+                    c.fill = STRIPE_FILL
+                col += 1
+
+    data_end_row = data_start_row + len(processed) - 1
+    ws.sheet_view.showGridLines = True
+    return {"sheet": "Processed Data", "cols": field_col, "start": data_start_row, "end": data_end_row}
+
+
+def _ref(pd_map: dict[str, Any], field_key: str, row_offset: int) -> str:
+    """Build a formula reference into Processed Data for the given field and
+    0-indexed month offset (0=first FY month)."""
+    col = pd_map["cols"][field_key]
+    row = pd_map["start"] + row_offset
+    return f"'{pd_map['sheet']}'!{col}{row}"
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation Grid - the sheet requested: GSTR-3B Sales/ITC/RCM/Cash-paid,
+# GSTR-1 Sales, a live GSTR-1-vs-GSTR-3B diff (so the same outward figure
+# doesn't have to be read twice and mentally compared), and a Tally
+# comparison block (manual entry, exactly like the reference template).
+# ---------------------------------------------------------------------------
+
+def _grid_header_block(ws: Worksheet, row: int, group_label: str, sub_headers: list[str], start_col: int) -> int:
+    end_col = start_col + len(sub_headers) - 1
+    ws.merge_cells(start_row=row, start_column=start_col, end_row=row, end_column=end_col)
+    gc = ws.cell(row=row, column=start_col, value=group_label)
+    gc.font = HEADER_FONT
+    gc.fill = HEADER_FILL
+    gc.alignment = Alignment(horizontal="center", vertical="center")
+    for i, sh in enumerate(sub_headers):
+        c = ws.cell(row=row + 1, column=start_col + i, value=sh)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.column_dimensions[get_column_letter(start_col + i)].width = 13
+    return end_col + 1
+
+
+def _build_reconciliation_grid_sheet(wb: Workbook, payload: dict[str, Any], pd_map: dict[str, Any]) -> None:
+    ws = _sheet(wb, "Reconciliation Grid")
+    row = _title(ws, "Monthly Reconciliation Grid - GSTR-3B, GSTR-1 and Books (Tally)", span=30)
+    row = _note(ws, row, "Every number below is a live formula pointing at the 'Processed Data' sheet - edit a figure there (or re-run the tool) and this grid recalculates. "
+                          "Tally cells (yellow) are the only ones you type into directly.", span=30)
+    row += 1
+
+    header_row = row
+    ws.cell(row=header_row, column=1, value="")
+    col = 2
+    blocks = [
+        ("GSTR-3B Sales", ["Taxable", "IGST", "CGST", "SGST"], ["g3b_taxable", "g3b_igst", "g3b_cgst", "g3b_sgst"]),
+        ("GSTR-3B Net ITC", ["IGST", "CGST", "SGST"], ["itc_igst", "itc_cgst", "itc_sgst"]),
+        ("GSTR-3B RCM Liability", ["Taxable", "IGST", "CGST", "SGST"], ["rcm_taxable", "rcm_igst", "rcm_cgst", "rcm_sgst"]),
+        ("Tax Paid in Cash (Regular)", ["IGST", "CGST", "SGST"], ["pay_igst_cash", "pay_cgst_cash", "pay_sgst_cash"]),
+        ("Tax Paid in Cash (RCM)", ["IGST", "CGST", "SGST"], ["rcm_pay_igst_cash", "rcm_pay_cgst_cash", "rcm_pay_sgst_cash"]),
+        ("GSTR-1 Sales", ["Taxable", "IGST", "CGST", "SGST"], ["g1_taxable", "g1_igst", "g1_cgst", "g1_sgst"]),
+    ]
+    col_positions: dict[str, list[int]] = {}
+    for label, subs, keys in blocks:
+        start_col = col
+        col = _grid_header_block(ws, header_row, label, subs, start_col)
+        col_positions[label] = list(range(start_col, col))
+
+    diff_start = col
+    diff_subs = ["Taxable", "IGST", "CGST", "SGST"]
+    col = _grid_header_block(ws, header_row, "GSTR-1 vs GSTR-3B (Sales already reported once - this is the check, not a third figure)", diff_subs, diff_start)
+    ws.row_dimensions[header_row].height = 34
+    ws.row_dimensions[header_row + 1].height = 30
+    ws.freeze_panes = ws.cell(row=header_row + 2, column=2)
+
+    data_row0 = header_row + 2
+    n_months = len(payload["processed_data"])
+    for i in range(n_months):
+        r = data_row0 + i
+        ws.cell(row=r, column=1, value=payload["processed_data"][i]["label"]).font = BOLD_BODY
+        if i % 2 == 0:
+            ws.cell(row=r, column=1).fill = STRIPE_FILL
+
+        for label, subs, keys in blocks:
+            for j, key in enumerate(keys):
+                c_idx = col_positions[label][j]
+                c = ws.cell(row=r, column=c_idx, value=f"={_ref(pd_map, key, i)}")
+                c.number_format = CURRENCY
+                c.font = BODY_FONT
+                c.border = BORDER
+                if i % 2 == 0:
+                    c.fill = STRIPE_FILL
+
+        g1_cols = col_positions["GSTR-1 Sales"]
+        g3_cols = col_positions["GSTR-3B Sales"]
+        for j in range(4):
+            c = ws.cell(row=r, column=diff_start + j, value=f"={get_column_letter(g1_cols[j])}{r}-{get_column_letter(g3_cols[j])}{r}")
+            c.number_format = CURRENCY
+            c.font = BODY_FONT
+            c.border = BORDER
+            if i % 2 == 0:
+                c.fill = STRIPE_FILL
+
+    total_row = data_row0 + n_months + 1
+    ws.cell(row=total_row, column=1, value="Total").font = BOLD_BODY
+    for c_idx in range(2, diff_start + 4):
+        col_letter = get_column_letter(c_idx)
+        c = ws.cell(row=total_row, column=c_idx, value=f"=SUM({col_letter}{data_row0}:{col_letter}{data_row0 + n_months - 1})")
+        c.number_format = CURRENCY
+        c.font = BOLD_BODY
+        c.fill = GROUP_FILL
+
+    diff_range = f"{get_column_letter(diff_start)}{data_row0}:{get_column_letter(diff_start + 3)}{data_row0 + n_months - 1}"
+    ws.conditional_formatting.add(
+        diff_range,
+        FormulaRule(formula=[f"ABS({get_column_letter(diff_start)}{data_row0})<=0.5"], fill=PatternFill("solid", fgColor=GREEN)),
+    )
+    ws.conditional_formatting.add(
+        diff_range,
+        FormulaRule(formula=[f"ABS({get_column_letter(diff_start)}{data_row0})>0.5"], fill=PatternFill("solid", fgColor=RED)),
+    )
+
+    # --- Tally comparison block ---
+    tally_title_row = total_row + 3
+    row = _section(ws, tally_title_row, "Books (Tally) Comparison - type your Tally sales/purchase figures below; the difference vs GSTR-3B is automatic", span=30)
+    header_row2 = row + 1
+    col = 2
+    tally_blocks = [
+        ("Tally Sales (type here)", ["Taxable", "IGST", "CGST", "SGST"]),
+        ("Tally Purchase / ITC (type here)", ["IGST", "CGST", "SGST"]),
+    ]
+    tcol_positions: dict[str, list[int]] = {}
+    for label, subs in tally_blocks:
+        start_col = col
+        col = _grid_header_block(ws, header_row2, label, subs, start_col)
+        tcol_positions[label] = list(range(start_col, col))
+
+    diff2_start = col
+    col = _grid_header_block(ws, header_row2, "Diff: Tally Sales vs GSTR-3B Sales", ["Taxable", "IGST", "CGST", "SGST"], diff2_start)
+    diff3_start = col
+    col = _grid_header_block(ws, header_row2, "Diff: Tally Purchase vs GSTR-3B Net ITC", ["IGST", "CGST", "SGST"], diff3_start)
+    ws.row_dimensions[header_row2].height = 34
+    ws.row_dimensions[header_row2 + 1].height = 30
+
+    tdata_row0 = header_row2 + 2
+    for i in range(n_months):
+        r = tdata_row0 + i
+        ws.cell(row=r, column=1, value=payload["processed_data"][i]["label"]).font = BOLD_BODY
+        for c_idx in tcol_positions["Tally Sales (type here)"] + tcol_positions["Tally Purchase / ITC (type here)"]:
+            c = ws.cell(row=r, column=c_idx, value=0)
+            c.number_format = CURRENCY
+            c.fill = MANUAL_FILL
+            c.border = BORDER
+
+        ts_cols = tcol_positions["Tally Sales (type here)"]
+        g3_cols = col_positions["GSTR-3B Sales"]
+        for j in range(4):
+            c = ws.cell(row=r, column=diff2_start + j,
+                        value=f"={get_column_letter(ts_cols[j])}{r}-{get_column_letter(g3_cols[j])}{data_row0 + i}")
+            c.number_format = CURRENCY
+            c.border = BORDER
+
+        tp_cols = tcol_positions["Tally Purchase / ITC (type here)"]
+        itc_cols = col_positions["GSTR-3B Net ITC"]
+        for j in range(3):
+            c = ws.cell(row=r, column=diff3_start + j,
+                        value=f"={get_column_letter(tp_cols[j])}{r}-{get_column_letter(itc_cols[j])}{data_row0 + i}")
+            c.number_format = CURRENCY
+            c.border = BORDER
+
+    ttotal_row = tdata_row0 + n_months + 1
+    ws.cell(row=ttotal_row, column=1, value="Total").font = BOLD_BODY
+    for c_idx in range(2, diff3_start + 3):
+        col_letter = get_column_letter(c_idx)
+        c = ws.cell(row=ttotal_row, column=c_idx, value=f"=SUM({col_letter}{tdata_row0}:{col_letter}{tdata_row0 + n_months - 1})")
+        c.number_format = CURRENCY
+        c.font = BOLD_BODY
+        c.fill = GROUP_FILL
+
+
+# ---------------------------------------------------------------------------
+# Payment & Compliance Detail - mines GSTR-3B Table 6.1 fully: for each tax
+# head, how much liability was cleared via same-head ITC, cross-head ITC,
+# and cash, plus interest and late fee actually recorded on the return.
+# ---------------------------------------------------------------------------
+
+def _build_payment_detail_sheet(wb: Workbook, payload: dict[str, Any], pd_map: dict[str, Any]) -> None:
+    ws = _sheet(wb, "Payment Detail")
+    row = _title(ws, "Payment & Compliance Detail - GSTR-3B Table 6.1", span=24)
+    row = _note(ws, row, "How each month's liability was actually cleared - same-head ITC, cross-utilised ITC from another head, cash, and any interest/late fee "
+                          "recorded on the return itself (not inferred from the ledger). Live formulas from Processed Data.", span=24)
+    row += 1
+
+    header_row = row
+    col = 2
+    blocks = [
+        ("IGST", ["Liability", "Via IGST ITC", "Via CGST/SGST ITC", "Cash Paid", "Interest", "Late Fee"],
+         ["pay_igst_liability", "pay_igst_itc_same", "pay_igst_itc_cross", "pay_igst_cash", "pay_igst_interest", "pay_igst_latefee"]),
+        ("CGST", ["Liability", "Via CGST ITC", "Via IGST ITC", "Cash Paid", "Interest", "Late Fee"],
+         ["pay_cgst_liability", "pay_cgst_itc_same", "pay_cgst_itc_cross", "pay_cgst_cash", "pay_cgst_interest", "pay_cgst_latefee"]),
+        ("SGST", ["Liability", "Via SGST ITC", "Via IGST ITC", "Cash Paid", "Interest", "Late Fee"],
+         ["pay_sgst_liability", "pay_sgst_itc_same", "pay_sgst_itc_cross", "pay_sgst_cash", "pay_sgst_interest", "pay_sgst_latefee"]),
+        ("RCM (always cash)", ["IGST Paid", "CGST Paid", "SGST Paid", "Interest", "Late Fee"],
+         ["rcm_pay_igst_cash", "rcm_pay_cgst_cash", "rcm_pay_sgst_cash", "rcm_pay_interest", "rcm_pay_latefee"]),
+    ]
+    col_positions: dict[str, list[int]] = {}
+    for label, subs, keys in blocks:
+        start_col = col
+        col = _grid_header_block(ws, header_row, label, subs, start_col)
+        col_positions[label] = list(range(start_col, col))
+    ws.row_dimensions[header_row].height = 24
+    ws.row_dimensions[header_row + 1].height = 30
+    ws.freeze_panes = ws.cell(row=header_row + 2, column=2)
+
+    data_row0 = header_row + 2
+    n_months = len(payload["processed_data"])
+    interest_latefee_cols = []
+    for label, subs, keys in blocks:
+        for j, sh in enumerate(subs):
+            if sh in ("Interest", "Late Fee"):
+                interest_latefee_cols.append(col_positions[label][j])
+
+    for i in range(n_months):
+        r = data_row0 + i
+        ws.cell(row=r, column=1, value=payload["processed_data"][i]["label"]).font = BOLD_BODY
+        if i % 2 == 0:
+            ws.cell(row=r, column=1).fill = STRIPE_FILL
+        for label, subs, keys in blocks:
+            for j, key in enumerate(keys):
+                c_idx = col_positions[label][j]
+                c = ws.cell(row=r, column=c_idx, value=f"={_ref(pd_map, key, i)}")
+                c.number_format = CURRENCY
+                c.font = BODY_FONT
+                c.border = BORDER
+                if i % 2 == 0:
+                    c.fill = STRIPE_FILL
+
+    total_row = data_row0 + n_months + 1
+    ws.cell(row=total_row, column=1, value="Total").font = BOLD_BODY
+    last_col = col - 1
+    for c_idx in range(2, last_col + 1):
+        col_letter = get_column_letter(c_idx)
+        c = ws.cell(row=total_row, column=c_idx, value=f"=SUM({col_letter}{data_row0}:{col_letter}{data_row0 + n_months - 1})")
+        c.number_format = CURRENCY
+        c.font = BOLD_BODY
+        c.fill = GROUP_FILL
+        if c_idx in interest_latefee_cols:
+            c.fill = PatternFill("solid", fgColor=AMBER)
+
+    row = total_row + 2
+    row = _note(ws, row, "Interest/Late Fee columns highlighted amber in the Total row - any non-zero total there is worth a closer look at which month triggered it.", span=24)
+
+
+# ---------------------------------------------------------------------------
+# Hidden raw sheets - full transaction-level detail kept for audit trail /
+# traceability, but hidden by default so the workbook opens on the readable
+# summary sheets, not a wall of routine invoice rows.
+# ---------------------------------------------------------------------------
+
+def _build_raw_table_sheet(wb: Workbook, name: str, rows: list[dict[str, Any]], columns: list[str]) -> None:
+    if not rows:
+        return
+    ws = _sheet(wb, name)
+    for i, col_name in enumerate(columns, start=1):
+        c = ws.cell(row=1, column=i, value=col_name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    for r_idx, rec in enumerate(rows, start=2):
+        for c_idx, col_name in enumerate(columns, start=1):
+            val = rec.get(col_name, "")
+            if isinstance(val, float):
+                val = round(val, 2)
+            ws.cell(row=r_idx, column=c_idx, value=val)
+    ws.freeze_panes = "A2"
+    ws.sheet_state = "hidden"
+
+
+def _build_raw_sheets(wb: Workbook, payload: dict[str, Any]) -> None:
+    b2b_rows = []
+    for pk, g2b in payload.get("gstr2b_by_period", {}).items():
+        for r in g2b.get("detail", []):
+            if r.get("sheet") == "B2B":
+                b2b_rows.append({**r, "period_key": pk})
+    _build_raw_table_sheet(
+        wb, "Raw - GSTR2B B2B", b2b_rows,
+        ["period_key", "gstin_supplier", "party_name", "invoice_no", "invoice_date", "taxable_value",
+         "igst", "cgst", "sgst", "cess", "rcm", "itc_availability", "reason"],
+    )
+    _build_raw_table_sheet(
+        wb, "Raw - Cash Ledger", payload["merged_cash"].get("transactions", []),
+        ["period_key", "date", "reference_no", "description", "txn_type", "igst", "cgst", "sgst", "cess", "source_file"],
+    )
+    _build_raw_table_sheet(
+        wb, "Raw - Credit Ledger", payload["merged_credit"].get("transactions", []),
+        ["period_key", "date", "reference_no", "description", "txn_type", "igst", "cgst", "sgst", "cess", "source_file"],
+    )
+    _build_raw_table_sheet(
+        wb, "Raw - Liability Ledger", payload["merged_liability"].get("transactions", []),
+        ["period_key", "date", "reference_no", "description", "txn_type", "igst", "cgst", "sgst", "cess", "source_file"],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -492,12 +797,14 @@ def build_report(payload: dict[str, Any], output_path: Path) -> None:
     wb.remove(wb.active)
 
     _build_executive_summary(wb, payload)
+    pd_map = _build_processed_data_sheet(wb, payload)
+    _build_reconciliation_grid_sheet(wb, payload, pd_map)
+    _build_payment_detail_sheet(wb, payload, pd_map)
     _build_observations_sheet(wb, payload)
-    _build_outward_sheet(wb, payload)
     _build_itc_sheet(wb, payload)
-    _build_ledger_sheet(wb, payload)
     _build_exception_sheet(wb, payload)
     _build_data_quality_sheet(wb, payload)
     _build_reference_sheet(wb, payload)
+    _build_raw_sheets(wb, payload)
 
     wb.save(output_path)

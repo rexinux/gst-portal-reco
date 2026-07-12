@@ -182,6 +182,47 @@ def parse_gstr3b(path: Path) -> dict[str, Any]:
     raise ValueError(f"Unsupported GSTR-3B file: {path}")
 
 
+def _parse_payment_table(rows: list[list[str]]) -> dict[str, Any]:
+    """Table 6.1 - Payment of tax. For each tax head: liability, ITC utilised
+    (with cross-head set-off detail), cash paid, interest, late fee - split
+    into (A) Other than reverse charge and (B) Reverse charge / Sec 9(5)."""
+    heads = ["igst", "cgst", "sgst", "cess"]
+    head_labels = {"Integrated": "igst", "Central": "cgst", "State/UT": "sgst", "Cess": "cess"}
+
+    def _section(start_idx: int) -> dict[str, dict[str, float]]:
+        out: dict[str, dict[str, float]] = {}
+        j = start_idx
+        seen = 0
+        while j < len(rows) and seen < 4:
+            label = normalize_space(rows[j][0]) if rows[j] else ""
+            head = next((v for k, v in head_labels.items() if label.startswith(k)), None)
+            if head:
+                r = rows[j]
+                out[head] = {
+                    "tax": _cell_num(r[1]) if len(r) > 1 else 0.0,
+                    "itc_igst": _cell_num(r[4]) if len(r) > 4 else 0.0,
+                    "itc_cgst": _cell_num(r[5]) if len(r) > 5 else 0.0,
+                    "itc_sgst": _cell_num(r[6]) if len(r) > 6 else 0.0,
+                    "itc_cess": _cell_num(r[7]) if len(r) > 7 else 0.0,
+                    "cash_paid": _cell_num(r[8]) if len(r) > 8 else 0.0,
+                    "interest": _cell_num(r[9]) if len(r) > 9 else 0.0,
+                    "late_fee": _cell_num(r[10]) if len(r) > 10 else 0.0,
+                }
+                seen += 1
+            j += 1
+        for h in heads:
+            out.setdefault(h, {"tax": 0.0, "itc_igst": 0.0, "itc_cgst": 0.0, "itc_sgst": 0.0, "itc_cess": 0.0, "cash_paid": 0.0, "interest": 0.0, "late_fee": 0.0})
+        return out
+
+    a_idx = next((i for i, r in enumerate(rows) if r and "(A) Other than reverse charge" in normalize_space(r[0])), None)
+    b_idx = next((i for i, r in enumerate(rows) if r and "(B) Reverse charge" in normalize_space(r[0])), None)
+
+    return {
+        "other_than_rcm": _section(a_idx + 1) if a_idx is not None else {h: {} for h in heads},
+        "rcm": _section(b_idx + 1) if b_idx is not None else {h: {} for h in heads},
+    }
+
+
 def _row4(row: list[str] | None, start: int = 1) -> list[float]:
     if not row:
         return [0.0, 0.0, 0.0, 0.0]
@@ -249,6 +290,9 @@ def _parse_gstr3b_pdf_text(text: str, path: Path) -> dict[str, Any]:
     out["restricted_igst"], out["restricted_cgst"], out["restricted_sgst"], out["restricted_cess"] = _row4(
         _find_row(rows, "(2) Ineligible ITC under section 16(4)")
     )
+
+    # 6.1: Payment of tax - liability, ITC set-off detail, cash, interest, late fee
+    out["payment_table"] = _parse_payment_table(rows)
 
     out["outward_total"] = round(out["outward_taxable"] + out["zero_rated_taxable"], 2)
     out["notes"] = "Summary PDF parsed at table level; invoice-level liability lines not available."
@@ -514,18 +558,21 @@ _LEDGER_LAYOUTS = {
         "tax_heads": ["igst", "cgst", "sgst", "cess"],
         "has_subbreakdown": True,
         "has_balance_group": True,
+        "group_has_total_col": False,
     },
     "electronic_liability_ledger": {
         "fixed_cols": ["sr_no", "date", "reference_no", "ledger_used", "description", "txn_type"],
         "tax_heads": ["igst", "cgst", "sgst", "cess"],
         "has_subbreakdown": True,
         "has_balance_group": True,
+        "group_has_total_col": False,
     },
     "electronic_credit_ledger": {
         "fixed_cols": ["sr_no", "date", "reference_no", "period_label", "description", "txn_type"],
         "tax_heads": ["igst", "cgst", "sgst", "cess"],
         "has_subbreakdown": False,
         "has_balance_group": True,
+        "group_has_total_col": True,
     },
 }
 
@@ -570,6 +617,7 @@ def parse_ledger_csv(path: Path, ledger_type: str | None = None) -> dict[str, An
     n_fixed = len(fixed_cols)
     tax_heads = layout["tax_heads"]
     sub_width = 6 if layout["has_subbreakdown"] else 1
+    group_total_col = 1 if layout.get("group_has_total_col") else 0
 
     data_start = header_idx + 2  # group-header row + sub-header row
 
@@ -577,10 +625,13 @@ def parse_ledger_csv(path: Path, ledger_type: str | None = None) -> dict[str, An
     opening_balance: dict[str, Any] = {}
     skipped_short_rows = 0
 
+    min_len = n_fixed + len(tax_heads) * sub_width * 2 + group_total_col * 2 if layout.get("has_balance_group") \
+        else n_fixed + len(tax_heads) * sub_width + group_total_col
+
     for row in raw_rows[data_start:]:
         if not row or not any(normalize_space(c) for c in row):
             continue
-        if len(row) < n_fixed + len(tax_heads) * sub_width:
+        if len(row) < min_len:
             skipped_short_rows += 1
             continue
 
@@ -594,11 +645,13 @@ def parse_ledger_csv(path: Path, ledger_type: str | None = None) -> dict[str, An
             if layout["has_subbreakdown"]:
                 rec[f"{head}_total_incl_other"] = safe_float(row[pos + 5])
             pos += sub_width
+        pos += group_total_col  # skip the group-level 'Total' column, if present
 
         if layout.get("has_balance_group"):
             for head in tax_heads:
                 rec[f"{head}_balance"] = safe_float(row[pos])
                 pos += sub_width
+            pos += group_total_col
 
         is_opening = normalize_key(rec.get("description", "")) == "OPENING BALANCE"
         rec["period_key"] = period_key_from_label(rec.get("period_label", "")) or period_key_from_date(rec.get("date", ""))
@@ -746,12 +799,3 @@ def _rows_to_flat_dict(rows: list[tuple[Any, ...]]) -> dict[str, Any]:
 def _first_match(text: str, pattern: str) -> str:
     m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
     return normalize_space(m.group(1)) if m else ""
-
-
-def _first_num(text: str, pattern: str) -> float:
-    m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-    if not m:
-        return 0.0
-    if m.lastindex and m.lastindex >= 1:
-        return safe_float(m.group(1))
-    return 0.0

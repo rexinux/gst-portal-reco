@@ -72,18 +72,42 @@ python -m py_code.main --input-root input --output output/gst_reconciliation_rep
 
 ## Output
 
-The workbook includes:
-- Executive Summary (headline numbers + filing ARNs per period)
-- Observations (auto-generated auditor's note)
-- Outward Reconciliation (GSTR-1 vs GSTR-3B)
-- ITC Reconciliation (GSTR-3B 4(A) buckets vs GSTR-2B, tax-head by tax-head)
-- Ledger Summary (period-wise cash/credit/liability activity + GSTR-3B cross-check)
-- Exception Register (uncommon GSTR-2B entries only, plus duplicate-invoice flags)
-- Data Quality (missing files, parse warnings, duplicate ledger rows dropped)
-- Reason Codes (reference table, only for codes actually triggered this run)
+The workbook has two kinds of sheets:
+
+**Live/editable (formula-driven):**
+- **Processed Data** - one row per FY month (Apr-Mar, always 12 rows), holding
+  every figure the sheets below need. This is the single source of truth -
+  edit a number here directly in Excel and everything referencing it
+  recalculates immediately, no re-run required.
+- **Reconciliation Grid** - the month-by-month comparison (GSTR-3B
+  Sales/ITC/RCM/Cash-paid, GSTR-1 Sales, a live GSTR-1-vs-GSTR-3B diff with
+  green/red conditional formatting, and a Tally/books comparison block with
+  yellow manual-entry cells). Every non-Tally cell is a formula pointing at
+  Processed Data.
+- **Payment Detail** - mines GSTR-3B Table 6.1 in full: for each tax head,
+  how much liability was cleared via same-head ITC, cross-utilised ITC from
+  another head, or cash - plus interest and late fee exactly as recorded on
+  the return itself (not inferred from the ledger).
+
+**Static (Python-generated, regenerated on each run):**
+- Executive Summary, Observations (auto-generated auditor's note), ITC
+  Reconciliation (GSTR-3B vs GSTR-2B bucket-level), Exception Register
+  (uncommon GSTR-2B entries only), Data Quality, Reason Codes.
+
+**Hidden (audit trail, unhide if you need to check a raw figure):**
+- Full B2B invoice list and all three electronic ledger transaction logs.
+  Kept for traceability, hidden by default to keep the workbook readable.
 
 ## Important limit
 
 Invoice-level GSTR-1 vs GSTR-2A/2B matching still needs an invoice-wise GSTR-1
-export (the portal summary PDF only gives table totals). GSTR-3B summary PDFs are
-parsed at table level and give exact figures for every line used in this report.
+export (the portal summary PDF only gives table totals). GSTR-3B summary PDFs
+are parsed at table level (via pdfplumber's table extraction, not text regex)
+and give exact figures for every line used in this report, including the full
+Table 6.1 payment breakdown.
+
+Tally/books data has no automated import yet - the Reconciliation Grid's
+Tally block is manual entry by design. A generic Tally XML importer is a
+possible future addition, but Tally's export structure varies enough between
+company configurations that it needs its own dedicated pass rather than being
+bolted on - see CHANGELOG.md if this gets picked up later.

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import rules
-from .utils import normalize_key, safe_float
+from .utils import fy_months, normalize_key, safe_float
 
 TOLERANCE = 0.50
 
@@ -307,7 +307,7 @@ def build_observations(
         if mismatches:
             notes.append(
                 f"{len(mismatches)} outward-supply figure(s) differ between GSTR-1 and GSTR-3B beyond rounding "
-                f"tolerance - see the Outward Reconciliation sheet for the exact heads affected."
+                f"tolerance - see the 'GSTR-1 vs GSTR-3B' columns on the Reconciliation Grid sheet for the exact heads affected."
             )
         else:
             notes.append("Outward supply values in GSTR-1 and GSTR-3B agree in full for this period.")
@@ -335,3 +335,111 @@ def build_observations(
         notes.append("No anomalies detected for this period beyond the routine RCM/ITC-restriction items noted above.")
 
     return notes
+
+
+# ---------------------------------------------------------------------------
+# Processed Data - one row per FY month, the single source of truth that the
+# formula-driven Report sheets reference directly (fixed row order = no
+# lookup needed, matches the reference template's own approach).
+# ---------------------------------------------------------------------------
+
+def _period_ledger_totals(merged: dict[str, Any], period_key: str) -> dict[str, float]:
+    credited = sum(
+        t.get("igst", 0.0) + t.get("cgst", 0.0) + t.get("sgst", 0.0) + t.get("cess", 0.0)
+        for t in merged.get("transactions", [])
+        if t.get("period_key") == period_key and t.get("txn_type") == "Credit"
+    )
+    debited = sum(
+        t.get("igst", 0.0) + t.get("cgst", 0.0) + t.get("sgst", 0.0) + t.get("cess", 0.0)
+        for t in merged.get("transactions", [])
+        if t.get("period_key") == period_key and t.get("txn_type") == "Debit"
+    )
+    return {"credited": credited, "debited": debited}
+
+
+def build_processed_data(
+    fy_start_year: int,
+    gstr1_by_period: dict[str, dict[str, Any]],
+    gstr3b_by_period: dict[str, dict[str, Any]],
+    gstr2b_by_period: dict[str, dict[str, Any]],
+    merged_credit: dict[str, Any],
+    merged_cash: dict[str, Any],
+    merged_liability: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rows = []
+    for label, pk in fy_months(fy_start_year):
+        g1 = gstr1_by_period.get(pk) or {}
+        g3b = gstr3b_by_period.get(pk) or {}
+        g2b = gstr2b_by_period.get(pk) or {}
+        pay = g3b.get("payment_table", {})
+        oth = pay.get("other_than_rcm", {})
+        rcm_pay = pay.get("rcm", {})
+
+        credit_tot = _period_ledger_totals(merged_credit, pk)
+        cash_tot = _period_ledger_totals(merged_cash, pk)
+
+        credit_accrued = sum(
+            t.get("igst", 0.0) + t.get("cgst", 0.0) + t.get("sgst", 0.0)
+            for t in merged_credit.get("transactions", [])
+            if t.get("period_key") == pk and t.get("txn_type") == "Credit"
+            and "ITC ACCRUED" in normalize_key(t.get("description", ""))
+        )
+        credit_utilised = sum(
+            t.get("igst", 0.0) + t.get("cgst", 0.0) + t.get("sgst", 0.0)
+            for t in merged_credit.get("transactions", [])
+            if t.get("period_key") == pk and t.get("txn_type") == "Debit"
+            and normalize_key(t.get("description", "")) == "OTHER THAN REVERSE CHARGE"
+        )
+
+        summary = g2b.get("summary", [])
+        g2b_all_other = _g2b_bucket(summary, "4(A)(5)")
+
+        rows.append({
+            "label": label, "period_key": pk,
+            "g1_taxable": safe_float(g1.get("total_liability") or g1.get("outward_total")),
+            "g1_igst": safe_float(g1.get("b2b_igst")), "g1_cgst": safe_float(g1.get("b2b_cgst")), "g1_sgst": safe_float(g1.get("b2b_sgst")),
+            "g1_arn": g1.get("arn", ""), "g1_arn_date": g1.get("arn_date", ""),
+            "g3b_taxable": safe_float(g3b.get("outward_taxable")) + safe_float(g3b.get("zero_rated_taxable")),
+            "g3b_igst": safe_float(g3b.get("outward_igst")), "g3b_cgst": safe_float(g3b.get("outward_cgst")), "g3b_sgst": safe_float(g3b.get("outward_sgst")),
+            "g3b_arn": g3b.get("arn", ""), "g3b_arn_date": g3b.get("arn_date", ""),
+            "itc_igst": safe_float(g3b.get("net_itc_igst")), "itc_cgst": safe_float(g3b.get("net_itc_cgst")), "itc_sgst": safe_float(g3b.get("net_itc_sgst")),
+            "rcm_taxable": safe_float(g3b.get("rcm_taxable")), "rcm_igst": safe_float(g3b.get("rcm_igst")),
+            "rcm_cgst": safe_float(g3b.get("rcm_cgst")), "rcm_sgst": safe_float(g3b.get("rcm_sgst")),
+            # Table 6.1 - Other than RCM
+            "pay_igst_liability": oth.get("igst", {}).get("tax", 0.0),
+            "pay_igst_itc_same": oth.get("igst", {}).get("itc_igst", 0.0),
+            "pay_igst_itc_cross": oth.get("igst", {}).get("itc_cgst", 0.0) + oth.get("igst", {}).get("itc_sgst", 0.0),
+            "pay_igst_cash": oth.get("igst", {}).get("cash_paid", 0.0),
+            "pay_igst_interest": oth.get("igst", {}).get("interest", 0.0),
+            "pay_igst_latefee": oth.get("igst", {}).get("late_fee", 0.0),
+            "pay_cgst_liability": oth.get("cgst", {}).get("tax", 0.0),
+            "pay_cgst_itc_same": oth.get("cgst", {}).get("itc_cgst", 0.0),
+            "pay_cgst_itc_cross": oth.get("cgst", {}).get("itc_igst", 0.0) + oth.get("cgst", {}).get("itc_sgst", 0.0),
+            "pay_cgst_cash": oth.get("cgst", {}).get("cash_paid", 0.0),
+            "pay_cgst_interest": oth.get("cgst", {}).get("interest", 0.0),
+            "pay_cgst_latefee": oth.get("cgst", {}).get("late_fee", 0.0),
+            "pay_sgst_liability": oth.get("sgst", {}).get("tax", 0.0),
+            "pay_sgst_itc_same": oth.get("sgst", {}).get("itc_sgst", 0.0),
+            "pay_sgst_itc_cross": oth.get("sgst", {}).get("itc_igst", 0.0) + oth.get("sgst", {}).get("itc_cgst", 0.0),
+            "pay_sgst_cash": oth.get("sgst", {}).get("cash_paid", 0.0),
+            "pay_sgst_interest": oth.get("sgst", {}).get("interest", 0.0),
+            "pay_sgst_latefee": oth.get("sgst", {}).get("late_fee", 0.0),
+            # Table 6.1 - RCM
+            "rcm_pay_igst_cash": rcm_pay.get("igst", {}).get("cash_paid", 0.0),
+            "rcm_pay_cgst_cash": rcm_pay.get("cgst", {}).get("cash_paid", 0.0),
+            "rcm_pay_sgst_cash": rcm_pay.get("sgst", {}).get("cash_paid", 0.0),
+            "rcm_pay_interest": sum(rcm_pay.get(h, {}).get("interest", 0.0) for h in ("igst", "cgst", "sgst", "cess")),
+            "rcm_pay_latefee": sum(rcm_pay.get(h, {}).get("late_fee", 0.0) for h in ("igst", "cgst", "sgst", "cess")),
+            # GSTR-2B
+            "g2b_avail_igst": sum(r["igst"] for r in summary) if summary else 0.0,
+            "g2b_avail_cgst": sum(r["cgst"] for r in summary) if summary else 0.0,
+            "g2b_avail_sgst": sum(r["sgst"] for r in summary) if summary else 0.0,
+            "g2b_uncommon_count": len(g2b.get("uncommon", [])),
+            "g2b_ineligible_cgst": safe_float(g3b.get("restricted_cgst")),
+            "g2b_ineligible_sgst": safe_float(g3b.get("restricted_sgst")),
+            # Ledgers
+            "cash_credited": cash_tot["credited"], "cash_debited": cash_tot["debited"],
+            "credit_accrued": credit_accrued, "credit_utilised": credit_utilised,
+            "credit_carried_fwd": round(credit_accrued - credit_utilised, 2),
+        })
+    return rows

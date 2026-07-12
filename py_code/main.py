@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import parsers, reconciler
+from . import parsers, reconciler, utils
 from .config import Config, FOLDERS, SUPPORTED_EXTENSIONS
 from .report import build_report
 
@@ -89,6 +89,12 @@ def run(config: Config) -> dict[str, Any]:
     if not all_periods:
         all_periods = ["UNKNOWN"]
 
+    fy_start_year = utils.infer_fy_start_year(all_periods)
+    processed_data = reconciler.build_processed_data(
+        fy_start_year, gstr1_by_period, gstr3b_by_period, gstr2b_by_period,
+        merged_credit, merged_cash, merged_liability,
+    )
+
     period_payloads = []
     for pk in all_periods:
         g1 = gstr1_by_period.get(pk)
@@ -140,6 +146,9 @@ def run(config: Config) -> dict[str, Any]:
         "merged_liability": merged_liability,
         "data_quality_notes": data_quality_notes,
         "tolerance": config.tolerance,
+        "fy_start_year": fy_start_year,
+        "processed_data": processed_data,
+        "gstr2b_by_period": gstr2b_by_period,
     }
     return payload
 
